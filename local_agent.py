@@ -4,84 +4,137 @@ local_agent.py
 A minimal, read-only autonomous agent that:
   - Gathers context from local sources (files, calendar feeds, RSS, etc.)
   - Reasons about that context using a local LLM via Ollama
-  - Sends reminders/questions to you via Telegram
-  - Reads your Telegram replies and incorporates them into the next reasoning cycle
+  - Responds to user messages in whatever channel they arrived on (chat loop)
+  - Sends proactive hourly reminders/updates to the primary channel (push loop)
 
 Dependencies:
-    pip install requests
+    pip install requests python-dotenv
 
 Setup:
   1. Install and run Ollama: https://ollama.com
      Pull your model, e.g.: ollama pull mistral
-  2. Create a Telegram bot via BotFather (@BotFather in Telegram), get your API token.
-  3. Find your Telegram chat ID: message your bot, then visit
-     https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
-     and look for "chat": {"id": ...}
-  4. Fill in the CONFIG section below.
-  5. Run: python local_agent.py
+  2. Configure your chosen channel (see channels/) and fill in .env (see .env.example).
+  3. Run: python local_agent.py
 """
 
-import requests
+import os
 import time
-import json
+import threading
 from datetime import datetime
 from pathlib import Path
 from collections import deque
+import requests
+from dotenv import load_dotenv
+from channels.telegram import TelegramChannel
+from channels.base import BaseChannel
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
-# CONFIG — fill these in before running
+# CONFIG
 # ---------------------------------------------------------------------------
 
-TELEGRAM_TOKEN   = "YOUR_BOT_TOKEN_HERE"          # from BotFather
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"            # your personal chat ID
+# --- LLM ---
+OLLAMA_URL   = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "MichelRosselli/apertus"
 
-OLLAMA_URL       = "http://localhost:11434/api/generate"
-OLLAMA_MODEL     = "mistral"                       # or whatever local model you use
+# --- Push loop: how often to run the proactive check ---
+PUSH_INTERVAL_SECONDS = 3600   # 1 hour
 
-POLL_INTERVAL_SECONDS = 300                        # how often the agent runs (5 min default)
-MAX_HISTORY_TURNS     = 10                         # rolling dialogue window (pairs of messages)
+# --- History ---
+MAX_HISTORY_TURNS = 10         # rolling window (each turn = 1 user + 1 agent entry)
 
-# Paths/URLs the agent is allowed to READ. Add or remove as you like.
-WATCHED_FILES    = [
+# --- Quiet hours (24-hour local time) — push messages are suppressed in this window ---
+# Set both to the same value to disable quiet hours entirely.
+QUIET_HOURS_START = 22         # 10 PM
+QUIET_HOURS_END   = 8          #  8 AM
+
+# --- Work schedule — controls push message framing, not suppression ---
+WORK_DAYS       = {0, 1, 2, 3, 4}  # Monday=0 … Friday=4
+WORK_HOUR_START = 9
+WORK_HOUR_END   = 17
+
+# --- Data sources ---
+WATCHED_FILES = [
+    Path.home() / "iCloudDrive" / "iCloud~md~obsidian" / "Planner" / "TODO.md"
     # Path.home() / "notes" / "todo.txt",
-    # Path.home() / "notes" / "journal.txt",
 ]
 
-ICAL_URLS        = [
-    # "https://calendar.google.com/calendar/ical/your_feed_here/basic.ics",
-]
+ICAL_URLS = [u for k, u in sorted(os.environ.items()) if k.startswith("ICAL_URL_")]
 
-RSS_URLS         = [
+RSS_URLS = [
     # "https://example.com/feed.rss",
 ]
 
 # ---------------------------------------------------------------------------
-# SYSTEM PROMPT — this constrains the agent's behaviour
+# SYSTEM PROMPTS
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """
-You are a read-only assistant monitoring context on behalf of the user.
-Your sole job is to notice things in the provided context that are worth
-bringing to the user's attention, or to respond helpfully to something
-the user said in a previous message.
+SYSTEM_PROMPT_CHAT = """
+You are a concise personal assistant. The user has just sent you a message.
+Respond directly and helpfully using the provided context (files, calendar,
+feeds, current time) and any relevant conversation history.
 
-Rules you must follow:
-- You cannot take any actions in the world. You have no tools.
-- Your only output is either a SHORT message to send to the user, or
-  exactly the single word NOTHING (in capitals) if there is nothing
-  worth saying right now.
-- Be concise. The user reads these on a mobile phone.
-- If the user has replied to a previous message, acknowledge it and
-  reason about it before deciding whether to send a new message.
-- Never fabricate information that is not in the provided context.
+Rules:
+- Always produce a reply. Never output NOTHING.
+- Keep replies short — the user reads these on a mobile device.
+- Only reference information present in the provided context or history.
+  Do not fabricate facts.
+- You cannot take actions in the world. You can only compose a text reply.
 """.strip()
+
+SYSTEM_PROMPT_PUSH = """
+You are a proactive personal assistant monitoring context on behalf of the user.
+Decide whether there is anything in the current context worth interrupting the
+user about right now.
+
+{focus_instruction}
+
+Output rules:
+- If there is something genuinely worth surfacing (an upcoming event, an
+  overdue task, an important update), output a SHORT message (2–4 sentences).
+  The user reads this on a mobile phone.
+- If there is nothing important, output exactly: NOTHING
+- Do not repeat something already mentioned in recent conversation history
+  unless circumstances have materially changed.
+- Never fabricate information not present in the provided context.
+""".strip()
+
+_FOCUS_WORK = (
+    "It is currently a work day during work hours. Focus on work-relevant reminders: "
+    "upcoming meetings, deadlines, and tasks in TODO files related to work. "
+    "Deprioritize personal or lifestyle topics."
+)
+_FOCUS_PERSONAL = (
+    "It is currently outside work hours. Focus on personal reminders: health, "
+    "social commitments, errands, and upcoming non-work calendar events. "
+    "Deprioritize work topics."
+)
+
+# ---------------------------------------------------------------------------
+# SCHEDULE HELPERS
+# ---------------------------------------------------------------------------
+
+def is_quiet_hours() -> bool:
+    """True if the current local hour falls inside the configured quiet window."""
+    hour = datetime.now().hour
+    if QUIET_HOURS_START == QUIET_HOURS_END:
+        return False
+    if QUIET_HOURS_START > QUIET_HOURS_END:    # window spans midnight
+        return hour >= QUIET_HOURS_START or hour < QUIET_HOURS_END
+    return QUIET_HOURS_START <= hour < QUIET_HOURS_END
+
+
+def is_work_hours() -> bool:
+    """True if the current local time is within the configured work schedule."""
+    now = datetime.now()
+    return now.weekday() in WORK_DAYS and WORK_HOUR_START <= now.hour < WORK_HOUR_END
 
 # ---------------------------------------------------------------------------
 # CONTEXT GATHERING — all read-only
 # ---------------------------------------------------------------------------
 
 def read_watched_files() -> str:
-    """Read local text files the user has opted in to monitoring."""
     parts = []
     for path in WATCHED_FILES:
         p = Path(path)
@@ -95,15 +148,13 @@ def read_watched_files() -> str:
 
 
 def fetch_ical_events() -> str:
-    """Fetch and naively extract upcoming event lines from iCal feeds."""
     parts = []
     for url in ICAL_URLS:
         try:
             r = requests.get(url, timeout=10)
             r.raise_for_status()
-            # Very lightweight parsing — just pull SUMMARY and DTSTART lines
-            lines = r.text.splitlines()
-            events = []
+            lines   = r.text.splitlines()
+            events  = []
             current = {}
             for line in lines:
                 if line.startswith("BEGIN:VEVENT"):
@@ -123,15 +174,13 @@ def fetch_ical_events() -> str:
 
 
 def fetch_rss_headlines() -> str:
-    """Fetch and extract titles from RSS feeds."""
+    import re
     parts = []
     for url in RSS_URLS:
         try:
             r = requests.get(url, timeout=10)
             r.raise_for_status()
-            # Lightweight extraction of <title> tags inside <item> blocks
-            import re
-            items = re.findall(r"<item>.*?</item>", r.text, re.DOTALL)
+            items  = re.findall(r"<item>.*?</item>", r.text, re.DOTALL)
             titles = []
             for item in items[:10]:
                 m = re.search(r"<title>(.*?)</title>", item, re.DOTALL)
@@ -145,20 +194,12 @@ def fetch_rss_headlines() -> str:
 
 
 def gather_context() -> str:
-    """Assemble all context into a single string to pass to the LLM."""
     sections = [f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"]
 
-    files_ctx = read_watched_files()
-    if files_ctx:
-        sections.append(files_ctx)
-
-    ical_ctx = fetch_ical_events()
-    if ical_ctx:
-        sections.append(ical_ctx)
-
-    rss_ctx = fetch_rss_headlines()
-    if rss_ctx:
-        sections.append(rss_ctx)
+    for fn in (read_watched_files, fetch_ical_events, fetch_rss_headlines):
+        chunk = fn()
+        if chunk:
+            sections.append(chunk)
 
     if len(sections) == 1:
         sections.append("(No context sources are configured yet.)")
@@ -166,82 +207,43 @@ def gather_context() -> str:
     return "\n\n".join(sections)
 
 # ---------------------------------------------------------------------------
-# TELEGRAM — send and receive
+# PROMPT BUILDERS
 # ---------------------------------------------------------------------------
 
-def telegram_send(text: str) -> None:
-    """Send a message to the user via Telegram."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"[Telegram send error] {e}")
+def _history_block(history: deque) -> str:
+    if not history:
+        return ""
+    lines = ["\n\n=== CONVERSATION HISTORY ==="]
+    for role, text in history:
+        lines.append(f"{'Agent' if role == 'agent' else 'User'}: {text}")
+    return "\n".join(lines)
 
 
-def telegram_get_updates(offset: int) -> tuple[list[dict], int]:
-    """
-    Poll Telegram for new messages from the user.
-    Returns (list of message texts, new offset).
-    Only accepts messages from the configured chat ID for safety.
-    """
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {"offset": offset, "timeout": 5}
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        print(f"[Telegram poll error] {e}")
-        return [], offset
+def build_chat_prompt(context: str, history: deque, new_user_messages: list[str]) -> str:
+    parts = [SYSTEM_PROMPT_CHAT, "\n\n=== CURRENT CONTEXT ===\n", context]
+    parts.append(_history_block(history))
+    if new_user_messages:
+        parts.append("\n\n=== NEW USER MESSAGES ===")
+        for msg in new_user_messages:
+            parts.append(f"User: {msg}")
+    parts.append("\n\n=== YOUR RESPONSE ===")
+    return "\n".join(parts)
 
-    messages = []
-    new_offset = offset
-    for update in data.get("result", []):
-        new_offset = max(new_offset, update["update_id"] + 1)
-        msg = update.get("message", {})
-        # Only accept messages from the authorised chat
-        if str(msg.get("chat", {}).get("id", "")) == str(TELEGRAM_CHAT_ID):
-            text = msg.get("text", "").strip()
-            if text:
-                messages.append(text)
 
-    return messages, new_offset
+def build_push_prompt(context: str, history: deque) -> str:
+    focus = _FOCUS_WORK if is_work_hours() else _FOCUS_PERSONAL
+    system = SYSTEM_PROMPT_PUSH.format(focus_instruction=focus)
+    parts  = [system, "\n\n=== CURRENT CONTEXT ===\n", context]
+    parts.append(_history_block(history))
+    parts.append("\n\n=== YOUR RESPONSE ===\nOutput a short message for the user, or NOTHING.")
+    return "\n".join(parts)
 
 # ---------------------------------------------------------------------------
 # LLM QUERY via Ollama
 # ---------------------------------------------------------------------------
 
-def build_prompt(context: str, history: deque, new_user_messages: list[str]) -> str:
-    """
-    Construct the full prompt string.
-    History is a deque of ("agent"|"user", text) tuples.
-    """
-    parts = [SYSTEM_PROMPT, "\n\n=== CURRENT CONTEXT ===\n", context]
-
-    if history:
-        parts.append("\n\n=== CONVERSATION HISTORY ===")
-        for role, text in history:
-            label = "Agent" if role == "agent" else "User"
-            parts.append(f"{label}: {text}")
-
-    if new_user_messages:
-        parts.append("\n\n=== NEW USER REPLIES ===")
-        for msg in new_user_messages:
-            parts.append(f"User: {msg}")
-
-    parts.append("\n\n=== YOUR RESPONSE ===\nRespond with either a concise message to the user, or the single word NOTHING.")
-    return "\n".join(parts)
-
-
 def query_llm(prompt: str) -> str:
-    """Send a prompt to the local Ollama instance and return the response text."""
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-    }
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
     try:
         r = requests.post(OLLAMA_URL, json=payload, timeout=120)
         r.raise_for_status()
@@ -251,45 +253,119 @@ def query_llm(prompt: str) -> str:
         return "NOTHING"
 
 # ---------------------------------------------------------------------------
-# MAIN LOOP
+# PUSH LOOP (daemon thread)
 # ---------------------------------------------------------------------------
 
-def main():
-    print(f"Agent starting. Model: {OLLAMA_MODEL}. Poll interval: {POLL_INTERVAL_SECONDS}s.")
-    telegram_send("Agent started. I will message you if I notice something worth your attention.")
+def push_loop(
+    primary_channel: BaseChannel,
+    history: deque,
+    history_lock: threading.Lock,
+) -> None:
+    """
+    Sleeps for PUSH_INTERVAL_SECONDS, then (if not in quiet hours) gathers
+    context, asks the LLM whether there is anything worth surfacing, and sends
+    a message to the primary channel if so.
+    """
+    while True:
+        time.sleep(PUSH_INTERVAL_SECONDS)
+        try:
+            if is_quiet_hours():
+                print("[Push] Quiet hours — skipping.")
+                continue
 
-    history: deque = deque(maxlen=MAX_HISTORY_TURNS * 2)  # each turn = 2 entries
-    telegram_offset = 0
+            context = gather_context()
 
-    # Drain any old pending Telegram messages on startup so we don't
-    # re-process messages from before the agent launched.
-    _, telegram_offset = telegram_get_updates(telegram_offset)
+            with history_lock:
+                snapshot = deque(history, maxlen=history.maxlen)
+
+            prompt   = build_push_prompt(context, snapshot)
+            response = query_llm(prompt)
+            print(f"[Push] {response[:100]}{'...' if len(response) > 100 else ''}")
+
+            if response.strip().upper() != "NOTHING" and response.strip():
+                primary_channel.send(response)
+                with history_lock:
+                    history.append(("agent", response))
+
+        except Exception as e:
+            print(f"[Push loop error] {e}")
+
+# ---------------------------------------------------------------------------
+# CHAT LOOP (main thread)
+# ---------------------------------------------------------------------------
+
+def chat_loop(
+    channels: list[BaseChannel],
+    history: deque,
+    history_lock: threading.Lock,
+) -> None:
+    """
+    Polls each channel on its own schedule (channel.poll_interval).
+    When a user message arrives, responds on the same channel it came from.
+    """
+    last_polled = {id(ch): 0.0 for ch in channels}
 
     while True:
         try:
-            # 1. Collect any replies the user sent since last cycle
-            new_user_messages, telegram_offset = telegram_get_updates(telegram_offset)
-            for msg in new_user_messages:
-                print(f"[User replied] {msg}")
-                history.append(("user", msg))
+            now = time.monotonic()
+            for channel in channels:
+                if now - last_polled[id(channel)] < channel.poll_interval:
+                    continue
+                last_polled[id(channel)] = now
 
-            # 2. Gather read-only context
-            context = gather_context()
+                new_messages = channel.get_updates()
+                if not new_messages:
+                    continue
 
-            # 3. Build prompt and query the LLM
-            prompt = build_prompt(context, history, [])
-            response = query_llm(prompt)
-            print(f"[LLM response] {response[:120]}{'...' if len(response) > 120 else ''}")
+                with history_lock:
+                    for msg in new_messages:
+                        print(f"[Chat] User ({channel.__class__.__name__}): {msg}")
+                        history.append(("user", msg))
+                    snapshot = deque(history, maxlen=history.maxlen)
 
-            # 4. Send message if the LLM decided to
-            if response.upper() != "NOTHING" and response:
-                telegram_send(response)
-                history.append(("agent", response))
+                context  = gather_context()
+                prompt   = build_chat_prompt(context, snapshot, new_messages)
+                response = query_llm(prompt)
+                print(f"[Chat] Agent: {response[:100]}{'...' if len(response) > 100 else ''}")
+
+                if response.strip():
+                    channel.send(response)
+                    with history_lock:
+                        history.append(("agent", response))
 
         except Exception as e:
-            print(f"[Main loop error] {e}")
+            print(f"[Chat loop error] {e}")
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+        time.sleep(1)
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+def main():
+    telegram = TelegramChannel()
+    telegram.on_startup()
+
+    channels        = [telegram]   # all channels polled by the chat loop
+    primary_channel = telegram     # where push notifications are sent
+
+    history      = deque(maxlen=MAX_HISTORY_TURNS * 2)
+    history_lock = threading.Lock()
+
+    push_thread = threading.Thread(
+        target=push_loop,
+        args=(primary_channel, history, history_lock),
+        daemon=True,
+        name="push-loop",
+    )
+    push_thread.start()
+    poll_summary = ", ".join(
+        f"{ch.__class__.__name__}={ch.poll_interval}s" for ch in channels
+    )
+    print(f"[Main] Agent running. Model: {OLLAMA_MODEL}. "
+          f"Chat polls: [{poll_summary}]. Push interval: {PUSH_INTERVAL_SECONDS}s.")
+
+    chat_loop(channels, history, history_lock)
 
 
 if __name__ == "__main__":
