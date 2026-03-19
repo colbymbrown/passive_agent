@@ -20,7 +20,7 @@ Setup:
 import os
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import deque
 import requests
@@ -30,13 +30,16 @@ from channels.base import BaseChannel
 
 load_dotenv()
 
+from backends import get_backend
+
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 
 # --- LLM ---
-OLLAMA_URL   = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "MichelRosselli/apertus"
+# Supports LLM_BACKENDS (comma-separated priority list) and legacy LLM_BACKEND.
+LLM_BACKENDS  = os.environ.get("LLM_BACKENDS") or os.environ.get("LLM_BACKEND", "ollama")
+_llm_backend  = get_backend(LLM_BACKENDS)
 
 # --- Push loop: how often to run the proactive check ---
 PUSH_INTERVAL_SECONDS = 3600   # 1 hour
@@ -56,7 +59,8 @@ WORK_HOUR_END   = 17
 
 # --- Data sources ---
 WATCHED_FILES = [
-    Path.home() / "iCloudDrive" / "iCloud~md~obsidian" / "Planner" / "TODO.md"
+    #Path.home() / "iCloudDrive" / "iCloud~md~obsidian" / "Planner" / "TODO.md"
+    Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Planner" / "TODO.md"
     # Path.home() / "notes" / "todo.txt",
 ]
 
@@ -72,11 +76,11 @@ RSS_URLS = [
 
 SYSTEM_PROMPT_CHAT = """
 You are a concise personal assistant. The user has just sent you a message.
-Respond directly and helpfully using the provided context (files, calendar,
-feeds, current time) and any relevant conversation history.
+Respond directly and helpfully using the provided context, as well as any 
+relevant conversation history.
 
 Rules:
-- Always produce a reply. Never output NOTHING.
+- Always produce a reply.
 - Keep replies short — the user reads these on a mobile device.
 - Only reference information present in the provided context or history.
   Do not fabricate facts.
@@ -84,20 +88,22 @@ Rules:
 """.strip()
 
 SYSTEM_PROMPT_PUSH = """
-You are a proactive personal assistant monitoring context on behalf of the user.
-Decide whether there is anything in the current context worth interrupting the
-user about right now.
+You are a proactive personal assistant, whose role is to remind the user of important tasks.
+Pick the single most important item from the current context to remind the user about right now.
 
 {focus_instruction}
 
 Output rules:
-- If there is something genuinely worth surfacing (an upcoming event, an
-  overdue task, an important update), output a SHORT message (2–4 sentences).
-  The user reads this on a mobile phone.
-- If there is nothing important, output exactly: NOTHING
+- Always output a SHORT message (2–4 sentences).
+- Pick one item: an upcoming event, a task, a deadline, or anything else
+  that deserves attention. If nothing is urgent, pick whatever is most
+  actionable or timely.  Do not assume that either the first or last item 
+  you see is the most important.
 - Do not repeat something already mentioned in recent conversation history
-  unless circumstances have materially changed.
-- Never fabricate information not present in the provided context.
+  unless it is becoming more urgent.
+- Never fabricate information not present in the provided context.  Do not
+  make assumptions about meetings associated with tasks, or deadline dates
+  and times not specifically mentioned.
 """.strip()
 
 _FOCUS_WORK = (
@@ -147,7 +153,25 @@ def read_watched_files() -> str:
     return "\n\n".join(parts)
 
 
+def _parse_ical_dt(value: str) -> datetime | None:
+    """Parse an iCal DTSTART/DTEND value into a naive local datetime."""
+    value = value.strip()
+    try:
+        if len(value) == 8:                        # all-day: 20191217
+            return datetime.strptime(value, "%Y%m%d")
+        if value.endswith("Z"):                    # UTC: 20191217T150000Z
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ")
+            return dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+        return datetime.strptime(value[:15], "%Y%m%dT%H%M%S")  # local / TZID
+    except Exception:
+        return None
+
+
 def fetch_ical_events() -> str:
+    today    = datetime.now().date()
+    tomorrow = today + timedelta(days=1)
+    cutoff   = today  # include today and tomorrow only
+
     parts = []
     for url in ICAL_URLS:
         try:
@@ -155,19 +179,32 @@ def fetch_ical_events() -> str:
             r.raise_for_status()
             lines   = r.text.splitlines()
             events  = []
-            current = {}
+            current: dict = {}
             for line in lines:
                 if line.startswith("BEGIN:VEVENT"):
                     current = {}
                 elif line.startswith("SUMMARY:"):
                     current["summary"] = line[8:]
                 elif line.startswith("DTSTART"):
-                    current["start"] = line.split(":")[-1]
+                    current["start_raw"] = line.split(":")[-1]
                 elif line.startswith("END:VEVENT"):
-                    if current:
-                        events.append(f"  {current.get('start','?')} — {current.get('summary','?')}")
+                    if not current:
+                        continue
+                    dt = _parse_ical_dt(current.get("start_raw", ""))
+                    if dt is None:
+                        continue
+                    event_date = dt.date()
+                    if event_date not in (today, tomorrow):
+                        continue
+                    label = "Today" if event_date == today else "Tomorrow"
+                    # all-day events have no time component
+                    if current.get("start_raw", "").isdigit() and len(current["start_raw"]) == 8:
+                        time_str = f"{label} (all day)"
+                    else:
+                        time_str = f"{label} at {dt.strftime('%I:%M %p').lstrip('0')}"
+                    events.append(f"  {time_str} — {current.get('summary', '?')}")
             if events:
-                parts.append("--- Calendar events ---\n" + "\n".join(events[:20]))
+                parts.append("--- Upcoming calendar events (today & tomorrow) ---\n" + "\n".join(events))
         except Exception as e:
             parts.append(f"--- Calendar feed error: {e} ---")
     return "\n\n".join(parts)
@@ -210,51 +247,41 @@ def gather_context() -> str:
 # PROMPT BUILDERS
 # ---------------------------------------------------------------------------
 
-def _history_block(history: deque) -> str:
-    if not history:
-        return ""
-    lines = ["\n\n=== CONVERSATION HISTORY ==="]
-    for role, text in history:
-        lines.append(f"{'Agent' if role == 'agent' else 'User'}: {text}")
-    return "\n".join(lines)
+def _history_to_messages(history: deque) -> list[dict]:
+    role_map = {"user": "user", "agent": "assistant"}
+    return [{"role": role_map[role], "content": text} for role, text in history]
 
 
-def build_chat_prompt(context: str, history: deque, new_user_messages: list[str]) -> str:
-    parts = [SYSTEM_PROMPT_CHAT, "\n\n=== CURRENT CONTEXT ===\n", context]
-    parts.append(_history_block(history))
-    if new_user_messages:
-        parts.append("\n\n=== NEW USER MESSAGES ===")
-        for msg in new_user_messages:
-            parts.append(f"User: {msg}")
-    parts.append("\n\n=== YOUR RESPONSE ===")
-    return "\n".join(parts)
+def build_chat_prompt(context: str, history: deque, new_user_messages: list[str]) -> tuple[str, list[dict]]:
+    system_prompt = SYSTEM_PROMPT_CHAT + "\n\n=== CURRENT CONTEXT ===\n" + context
+    messages = _history_to_messages(history)
+    for msg in new_user_messages:
+        messages.append({"role": "user", "content": msg})
+    return system_prompt, messages
 
 
-def build_push_prompt(context: str, history: deque) -> str:
+def build_push_prompt(context: str, history: deque) -> tuple[str, list[dict]]:
     focus = _FOCUS_WORK if is_work_hours() else _FOCUS_PERSONAL
-    system = SYSTEM_PROMPT_PUSH.format(focus_instruction=focus)
-    parts  = [system, "\n\n=== CURRENT CONTEXT ===\n", context]
-    parts.append(_history_block(history))
-    parts.append("\n\n=== YOUR RESPONSE ===\nOutput a short message for the user, or NOTHING.")
-    return "\n".join(parts)
+    system_prompt = SYSTEM_PROMPT_PUSH.format(focus_instruction=focus) + "\n\n=== CURRENT CONTEXT ===\n" + context
+    messages = _history_to_messages(history)
+    messages.append({"role": "user", "content": "What should I be aware of right now?"})
+    return system_prompt, messages
 
 # ---------------------------------------------------------------------------
-# LLM QUERY via Ollama
+# LLM QUERY
 # ---------------------------------------------------------------------------
 
-def query_llm(prompt: str) -> str:
-    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
-    try:
-        r = requests.post(OLLAMA_URL, json=payload, timeout=120)
-        r.raise_for_status()
-        return r.json().get("response", "").strip()
-    except Exception as e:
-        print(f"[Ollama error] {e}")
-        return "NOTHING"
+def query_llm(system_prompt: str, messages: list[dict]) -> str | None:
+    print(f"[LLM system] {system_prompt[:120]}{'...' if len(system_prompt) > 120 else ''}")
+    print(f"[LLM messages] {len(messages)} message(s)")
+    return _llm_backend.query(system_prompt, messages)
 
 # ---------------------------------------------------------------------------
 # PUSH LOOP (daemon thread)
 # ---------------------------------------------------------------------------
+
+PUSH_RETRY_SECONDS = 300   # retry a failed push after 5 minutes
+
 
 def push_loop(
     primary_channel: BaseChannel,
@@ -264,13 +291,16 @@ def push_loop(
     """
     Sleeps for PUSH_INTERVAL_SECONDS, then (if not in quiet hours) gathers
     context, asks the LLM whether there is anything worth surfacing, and sends
-    a message to the primary channel if so.
+    a message to the primary channel if so.  On failure, retries after
+    PUSH_RETRY_SECONDS rather than waiting the full interval again.
     """
+    next_push = time.monotonic() + PUSH_INTERVAL_SECONDS
+
     while True:
-        time.sleep(PUSH_INTERVAL_SECONDS)
         try:
             if is_quiet_hours():
                 print("[Push] Quiet hours — skipping.")
+                next_push = time.monotonic() + PUSH_INTERVAL_SECONDS
                 continue
 
             context = gather_context()
@@ -278,17 +308,28 @@ def push_loop(
             with history_lock:
                 snapshot = deque(history, maxlen=history.maxlen)
 
-            prompt   = build_push_prompt(context, snapshot)
-            response = query_llm(prompt)
-            print(f"[Push] {response[:100]}{'...' if len(response) > 100 else ''}")
+            system_prompt, messages = build_push_prompt(context, snapshot)
+            response = query_llm(system_prompt, messages)
 
-            if response.strip().upper() != "NOTHING" and response.strip():
-                primary_channel.send(response)
-                with history_lock:
-                    history.append(("agent", response))
+            if not response:
+                print("[Push] LLM returned nothing — will retry in "
+                      f"{PUSH_RETRY_SECONDS // 60} min.")
+                next_push = time.monotonic() + PUSH_RETRY_SECONDS
+                continue
+
+            print(f"[Push] {response[:100]}{'...' if len(response) > 100 else ''}")
+            primary_channel.send(response)
+            with history_lock:
+                history.append(("agent", response))
+            next_push = time.monotonic() + PUSH_INTERVAL_SECONDS
 
         except Exception as e:
-            print(f"[Push loop error] {e}")
+            print(f"[Push loop error] {e} — will retry in "
+                  f"{PUSH_RETRY_SECONDS // 60} min.")
+            next_push = time.monotonic() + PUSH_RETRY_SECONDS
+
+        sleep_for = max(0, next_push - time.monotonic())
+        time.sleep(sleep_for)
 
 # ---------------------------------------------------------------------------
 # CHAT LOOP (main thread)
@@ -324,14 +365,16 @@ def chat_loop(
                     snapshot = deque(history, maxlen=history.maxlen)
 
                 context  = gather_context()
-                prompt   = build_chat_prompt(context, snapshot, new_messages)
-                response = query_llm(prompt)
-                print(f"[Chat] Agent: {response[:100]}{'...' if len(response) > 100 else ''}")
+                system_prompt, messages = build_chat_prompt(context, snapshot, new_messages)
+                response = query_llm(system_prompt, messages)
+                if not response:
+                    print("[Chat] LLM returned nothing — skipping reply.")
+                    continue
 
-                if response.strip():
-                    channel.send(response)
-                    with history_lock:
-                        history.append(("agent", response))
+                print(f"[Chat] Agent: {response[:100]}{'...' if len(response) > 100 else ''}")
+                channel.send(response)
+                with history_lock:
+                    history.append(("agent", response))
 
         except Exception as e:
             print(f"[Chat loop error] {e}")
@@ -362,7 +405,7 @@ def main():
     poll_summary = ", ".join(
         f"{ch.__class__.__name__}={ch.poll_interval}s" for ch in channels
     )
-    print(f"[Main] Agent running. Model: {OLLAMA_MODEL}. "
+    print(f"[Main] Agent running. Backends: {LLM_BACKENDS}. "
           f"Chat polls: [{poll_summary}]. Push interval: {PUSH_INTERVAL_SECONDS}s.")
 
     chat_loop(channels, history, history_lock)
