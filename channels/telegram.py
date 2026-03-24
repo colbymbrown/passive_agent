@@ -1,6 +1,33 @@
+import html as _html
 import os
+import re
 import requests
 from .base import BaseChannel
+
+
+def _md_to_html(text: str) -> str:
+    """Convert Claude's markdown output to Telegram-compatible HTML."""
+    # Split on code spans/blocks first so we don't mangle their contents
+    segments = re.split(r'(```[\s\S]*?```|`[^`\n]+`)', text)
+    result = []
+    for i, seg in enumerate(segments):
+        if i % 2 == 1:  # code segment
+            if seg.startswith('```'):
+                code = re.sub(r'^```\w*\n?', '', seg).rstrip('`').strip()
+                result.append(f'<pre>{_html.escape(code)}</pre>')
+            else:
+                result.append(f'<code>{_html.escape(seg[1:-1])}</code>')
+        else:
+            seg = _html.escape(seg)
+            seg = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', seg, flags=re.DOTALL)
+            seg = re.sub(r'__(.+?)__',     r'<b>\1</b>', seg, flags=re.DOTALL)
+            seg = re.sub(r'\*(.+?)\*',     r'<i>\1</i>', seg, flags=re.DOTALL)
+            seg = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<i>\1</i>', seg, flags=re.DOTALL)
+            seg = re.sub(r'^\#{1,6}\s+(.+)$', r'<b>\1</b>', seg, flags=re.MULTILINE)
+            seg = re.sub(r'^\[(.+?)\]\((.+?)\)$', r'<a href="\2">\1</a>', seg)
+            seg = re.sub(r'^[-*]\s+', '• ', seg, flags=re.MULTILINE)
+            result.append(seg)
+    return ''.join(result)
 
 
 _BACKOFF_CAP = 60  # max seconds between poll retries when network is down
@@ -19,7 +46,7 @@ class TelegramChannel(BaseChannel):
 
     def send(self, text: str) -> None:
         url     = f"https://api.telegram.org/bot{self._token}/sendMessage"
-        payload = {"chat_id": self._chat_id, "text": text}
+        payload = {"chat_id": self._chat_id, "text": _md_to_html(text), "parse_mode": "HTML"}
         try:
             r = requests.post(url, json=payload, timeout=10)
             r.raise_for_status()

@@ -18,14 +18,18 @@ Setup:
 """
 
 import os
+import json
 import time
 import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import deque
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests
 from dotenv import load_dotenv
 from channels.telegram import TelegramChannel
+from channels.slack import SlackChannel
+from channels.discord import DiscordChannel
 from channels.base import BaseChannel
 
 load_dotenv()
@@ -46,6 +50,7 @@ PUSH_INTERVAL_SECONDS = 3600   # 1 hour
 
 # --- History ---
 MAX_HISTORY_TURNS = 10         # rolling window (each turn = 1 user + 1 agent entry)
+HISTORY_FILE = Path(__file__).parent / "history.json"
 
 # --- Quiet hours (24-hour local time) — push messages are suppressed in this window ---
 # Set both to the same value to disable quiet hours entirely.
@@ -55,13 +60,14 @@ QUIET_HOURS_END   = 8          #  8 AM
 # --- Work schedule — controls push message framing, not suppression ---
 WORK_DAYS       = {0, 1, 2, 3, 4}  # Monday=0 … Friday=4
 WORK_HOUR_START = 9
-WORK_HOUR_END   = 17
+WORK_HOUR_END   = 15
 
 # --- Data sources ---
 WATCHED_FILES = [
-    #Path.home() / "iCloudDrive" / "iCloud~md~obsidian" / "Planner" / "TODO.md"
-    Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Planner" / "TODO.md"
+    # Path.home() / "iCloudDrive" / "iCloud~md~obsidian" / "Planner" / "TODO.md"
+    # Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Planner" / "TODO.md"
     # Path.home() / "notes" / "todo.txt",
+    "E:/Sync/Planner/TODO.md"
 ]
 
 ICAL_URLS = [u for k, u in sorted(os.environ.items()) if k.startswith("ICAL_URL_")]
@@ -76,34 +82,35 @@ RSS_URLS = [
 
 SYSTEM_PROMPT_CHAT = """
 You are a concise personal assistant. The user has just sent you a message.
-Respond directly and helpfully using the provided context, as well as any 
-relevant conversation history.
+Respond directly and helpfully using the provided context (files, calendar,
+feeds, current time), as well as any relevant conversation history.
 
 Rules:
 - Always produce a reply.
 - Keep replies short — the user reads these on a mobile device.
+- Do not use markdown formatting, nor emojis, nor bulleted lists.
 - Only reference information present in the provided context or history.
   Do not fabricate facts.
 - You cannot take actions in the world. You can only compose a text reply.
 """.strip()
 
 SYSTEM_PROMPT_PUSH = """
-You are a proactive personal assistant, whose role is to remind the user of important tasks.
-Pick the single most important item from the current context to remind the user about right now.
+You are a proactive personal assistant surfacing timely reminders to the user.
+
+Do NOT try to rank items by importance. You do not have enough real-world context to judge
+which task matters most, and attempting to do so causes you to repeat the same item.
+
+Select one item using this order:
+1. Prefer items that are imminent (happening soon today or tomorrow).
+2. Among equally timely items, strongly prefer something NOT already in recent history.
+3. If everything has been mentioned recently, pick whichever is soonest.
 
 {focus_instruction}
 
 Output rules:
-- Always output a SHORT message (2–4 sentences).
-- Pick one item: an upcoming event, a task, a deadline, or anything else
-  that deserves attention. If nothing is urgent, pick whatever is most
-  actionable or timely.  Do not assume that either the first or last item 
-  you see is the most important.
-- Do not repeat something already mentioned in recent conversation history
-  unless it is becoming more urgent.
-- Never fabricate information not present in the provided context.  Do not
-  make assumptions about meetings associated with tasks, or deadline dates
-  and times not specifically mentioned.
+- Always output a SHORT message (2-4 sentences).
+- Do not repeat something already in recent conversation history.
+- Never fabricate information not present in the provided context.
 """.strip()
 
 _FOCUS_WORK = (
@@ -153,8 +160,130 @@ def read_watched_files() -> str:
     return "\n\n".join(parts)
 
 
-def _parse_ical_dt(value: str) -> datetime | None:
-    """Parse an iCal DTSTART/DTEND value into a naive local datetime."""
+# Mapping from Windows timezone names (used by Outlook/Exchange) to IANA names.
+# Source: https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/default-time-zones
+_WINDOWS_TZ_MAP: dict[str, str] = {
+    "Dateline Standard Time": "Etc/GMT+12",
+    "UTC-11": "Etc/GMT+11",
+    "Aleutian Standard Time": "America/Adak",
+    "Hawaiian Standard Time": "Pacific/Honolulu",
+    "Marquesas Standard Time": "Pacific/Marquesas",
+    "Alaskan Standard Time": "America/Anchorage",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "Pacific Standard Time (Mexico)": "America/Tijuana",
+    "US Mountain Standard Time": "America/Phoenix",
+    "Mountain Standard Time": "America/Denver",
+    "Mountain Standard Time (Mexico)": "America/Chihuahua",
+    "Central America Standard Time": "America/Guatemala",
+    "Central Standard Time": "America/Chicago",
+    "Central Standard Time (Mexico)": "America/Mexico_City",
+    "Canada Central Standard Time": "America/Regina",
+    "SA Pacific Standard Time": "America/Bogota",
+    "Eastern Standard Time": "America/New_York",
+    "Eastern Standard Time (Mexico)": "America/Cancun",
+    "US Eastern Standard Time": "America/Indiana/Indianapolis",
+    "Haiti Standard Time": "America/Port-au-Prince",
+    "Cuba Standard Time": "America/Havana",
+    "Atlantic Standard Time": "America/Halifax",
+    "Venezuela Standard Time": "America/Caracas",
+    "Paraguay Standard Time": "America/Asuncion",
+    "Central Brazilian Standard Time": "America/Cuiaba",
+    "SA Western Standard Time": "America/La_Paz",
+    "Pacific SA Standard Time": "America/Santiago",
+    "Newfoundland Standard Time": "America/St_Johns",
+    "E. South America Standard Time": "America/Sao_Paulo",
+    "SA Eastern Standard Time": "America/Cayenne",
+    "Argentina Standard Time": "America/Argentina/Buenos_Aires",
+    "Greenland Standard Time": "America/Godthab",
+    "Montevideo Standard Time": "America/Montevideo",
+    "Magallanes Standard Time": "America/Punta_Arenas",
+    "Bahia Standard Time": "America/Bahia",
+    "UTC-02": "Etc/GMT+2",
+    "Azores Standard Time": "Atlantic/Azores",
+    "Cape Verde Standard Time": "Atlantic/Cape_Verde",
+    "UTC": "UTC",
+    "GMT Standard Time": "Europe/London",
+    "Greenwich Standard Time": "Atlantic/Reykjavik",
+    "Morocco Standard Time": "Africa/Casablanca",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Central Europe Standard Time": "Europe/Budapest",
+    "Romance Standard Time": "Europe/Paris",
+    "Central European Standard Time": "Europe/Warsaw",
+    "W. Central Africa Standard Time": "Africa/Lagos",
+    "Jordan Standard Time": "Asia/Amman",
+    "GTB Standard Time": "Europe/Bucharest",
+    "Middle East Standard Time": "Asia/Beirut",
+    "Egypt Standard Time": "Africa/Cairo",
+    "E. Europe Standard Time": "Asia/Nicosia",
+    "Syria Standard Time": "Asia/Damascus",
+    "South Africa Standard Time": "Africa/Johannesburg",
+    "FLE Standard Time": "Europe/Kiev",
+    "Israel Standard Time": "Asia/Jerusalem",
+    "Kaliningrad Standard Time": "Europe/Kaliningrad",
+    "Libya Standard Time": "Africa/Tripoli",
+    "Namibia Standard Time": "Africa/Windhoek",
+    "Arabic Standard Time": "Asia/Baghdad",
+    "Turkey Standard Time": "Europe/Istanbul",
+    "Arab Standard Time": "Asia/Riyadh",
+    "Russian Standard Time": "Europe/Moscow",
+    "E. Africa Standard Time": "Africa/Nairobi",
+    "Iran Standard Time": "Asia/Tehran",
+    "Arabian Standard Time": "Asia/Dubai",
+    "Azerbaijan Standard Time": "Asia/Baku",
+    "Mauritius Standard Time": "Indian/Mauritius",
+    "Georgian Standard Time": "Asia/Tbilisi",
+    "Caucasus Standard Time": "Asia/Yerevan",
+    "Afghanistan Standard Time": "Asia/Kabul",
+    "West Asia Standard Time": "Asia/Tashkent",
+    "Ekaterinburg Standard Time": "Asia/Yekaterinburg",
+    "Pakistan Standard Time": "Asia/Karachi",
+    "India Standard Time": "Asia/Calcutta",
+    "Sri Lanka Standard Time": "Asia/Colombo",
+    "Nepal Standard Time": "Asia/Katmandu",
+    "Central Asia Standard Time": "Asia/Almaty",
+    "Bangladesh Standard Time": "Asia/Dhaka",
+    "Myanmar Standard Time": "Asia/Rangoon",
+    "SE Asia Standard Time": "Asia/Bangkok",
+    "China Standard Time": "Asia/Shanghai",
+    "Singapore Standard Time": "Asia/Singapore",
+    "W. Australia Standard Time": "Australia/Perth",
+    "Taipei Standard Time": "Asia/Taipei",
+    "Ulaanbaatar Standard Time": "Asia/Ulaanbaatar",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "Korea Standard Time": "Asia/Seoul",
+    "Cen. Australia Standard Time": "Australia/Adelaide",
+    "AUS Central Standard Time": "Australia/Darwin",
+    "E. Australia Standard Time": "Australia/Brisbane",
+    "AUS Eastern Standard Time": "Australia/Sydney",
+    "Tasmania Standard Time": "Australia/Hobart",
+    "Vladivostok Standard Time": "Asia/Vladivostok",
+    "New Zealand Standard Time": "Pacific/Auckland",
+    "UTC+12": "Etc/GMT-12",
+    "Fiji Standard Time": "Pacific/Fiji",
+    "Chatham Islands Standard Time": "Pacific/Chatham",
+    "Tonga Standard Time": "Pacific/Tongatapu",
+    "Samoa Standard Time": "Pacific/Apia",
+    "Line Islands Standard Time": "Pacific/Kiritimati",
+}
+
+
+def _ical_unfold(text: str) -> list[str]:
+    """Unfold iCal line continuations per RFC 5545 §3.1."""
+    lines: list[str] = []
+    for raw in text.splitlines():
+        if raw and raw[0] in (" ", "\t") and lines:
+            lines[-1] += raw[1:]
+        else:
+            lines.append(raw)
+    return lines
+
+
+def _parse_ical_dt(value: str, tzid: str | None = None) -> datetime | None:
+    """Parse an iCal DTSTART/DTEND value into a naive local datetime.
+
+    tzid, if provided, is the TZID parameter value from the property line.
+    It may be an IANA name or a Windows timezone name.
+    """
     value = value.strip()
     try:
         if len(value) == 8:                        # all-day: 20191217
@@ -162,7 +291,15 @@ def _parse_ical_dt(value: str) -> datetime | None:
         if value.endswith("Z"):                    # UTC: 20191217T150000Z
             dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ")
             return dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
-        return datetime.strptime(value[:15], "%Y%m%dT%H%M%S")  # local / TZID
+        dt = datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
+        if tzid:
+            iana = _WINDOWS_TZ_MAP.get(tzid, tzid)  # map Windows name → IANA if needed
+            try:
+                tz = ZoneInfo(iana)
+                return dt.replace(tzinfo=tz).astimezone().replace(tzinfo=None)
+            except (ZoneInfoNotFoundError, KeyError):
+                pass  # unknown TZID — fall back to treating as local time
+        return dt
     except Exception:
         return None
 
@@ -177,7 +314,7 @@ def fetch_ical_events() -> str:
         try:
             r = requests.get(url, timeout=10)
             r.raise_for_status()
-            lines   = r.text.splitlines()
+            lines   = _ical_unfold(r.text)
             events  = []
             current: dict = {}
             for line in lines:
@@ -186,19 +323,26 @@ def fetch_ical_events() -> str:
                 elif line.startswith("SUMMARY:"):
                     current["summary"] = line[8:]
                 elif line.startswith("DTSTART"):
-                    current["start_raw"] = line.split(":")[-1]
+                    prop, _, val = line.partition(":")
+                    current["start_raw"] = val
+                    for param in prop.split(";")[1:]:
+                        if param.startswith("TZID="):
+                            current["start_tzid"] = param[5:]
                 elif line.startswith("END:VEVENT"):
                     if not current:
                         continue
-                    dt = _parse_ical_dt(current.get("start_raw", ""))
+                    dt = _parse_ical_dt(current.get("start_raw", ""), current.get("start_tzid"))
                     if dt is None:
                         continue
                     event_date = dt.date()
                     if event_date not in (today, tomorrow):
                         continue
+                    is_all_day = current.get("start_raw", "").isdigit() and len(current["start_raw"]) == 8
+                    # Skip today's timed events that have already started
+                    if event_date == today and not is_all_day and dt < datetime.now():
+                        continue
                     label = "Today" if event_date == today else "Tomorrow"
-                    # all-day events have no time component
-                    if current.get("start_raw", "").isdigit() and len(current["start_raw"]) == 8:
+                    if is_all_day:
                         time_str = f"{label} (all day)"
                     else:
                         time_str = f"{label} at {dt.strftime('%I:%M %p').lstrip('0')}"
@@ -243,6 +387,33 @@ def gather_context() -> str:
 
     return "\n\n".join(sections)
 
+def load_history() -> deque:
+    """Load persisted history from disk, or return an empty deque on any error."""
+    maxlen = MAX_HISTORY_TURNS * 2
+    try:
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        entries = [(r, t) for r, t in data if r in ("user", "agent")]
+        d = deque(entries, maxlen=maxlen)
+        print(f"[History] Loaded {len(d)} entries from {HISTORY_FILE}.")
+        return d
+    except FileNotFoundError:
+        return deque(maxlen=maxlen)
+    except Exception as e:
+        print(f"[History] Could not load history ({e}) — starting fresh.")
+        return deque(maxlen=MAX_HISTORY_TURNS * 2)
+
+
+def save_history(history: deque) -> None:
+    """Persist history to disk. Called while history_lock is held."""
+    try:
+        HISTORY_FILE.write_text(
+            json.dumps(list(history), ensure_ascii=False, indent=None),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"[History] Save error: {e}")
+
+
 # ---------------------------------------------------------------------------
 # PROMPT BUILDERS
 # ---------------------------------------------------------------------------
@@ -284,14 +455,15 @@ PUSH_RETRY_SECONDS = 300   # retry a failed push after 5 minutes
 
 
 def push_loop(
-    primary_channel: BaseChannel,
+    get_push_channel,   # callable() -> BaseChannel; called each cycle to pick channel
     history: deque,
     history_lock: threading.Lock,
 ) -> None:
     """
     Sleeps for PUSH_INTERVAL_SECONDS, then (if not in quiet hours) gathers
     context, asks the LLM whether there is anything worth surfacing, and sends
-    a message to the primary channel if so.  On failure, retries after
+    a message to the selected channel.  The channel is re-evaluated each cycle
+    so that work-hours routing is always current.  On failure, retries after
     PUSH_RETRY_SECONDS rather than waiting the full interval again.
     """
     next_push = time.monotonic() + PUSH_INTERVAL_SECONDS
@@ -303,6 +475,7 @@ def push_loop(
                 next_push = time.monotonic() + PUSH_INTERVAL_SECONDS
                 continue
 
+            channel = get_push_channel()
             context = gather_context()
 
             with history_lock:
@@ -317,10 +490,12 @@ def push_loop(
                 next_push = time.monotonic() + PUSH_RETRY_SECONDS
                 continue
 
-            print(f"[Push] {response[:100]}{'...' if len(response) > 100 else ''}")
-            primary_channel.send(response)
+            print(f"[Push] → {channel.__class__.__name__}: "
+                  f"{response[:100]}{'...' if len(response) > 100 else ''}")
+            channel.send(response)
             with history_lock:
                 history.append(("agent", response))
+                save_history(history)
             next_push = time.monotonic() + PUSH_INTERVAL_SECONDS
 
         except Exception as e:
@@ -362,6 +537,7 @@ def chat_loop(
                     for msg in new_messages:
                         print(f"[Chat] User ({channel.__class__.__name__}): {msg}")
                         history.append(("user", msg))
+                    save_history(history)
                     snapshot = deque(history, maxlen=history.maxlen)
 
                 context  = gather_context()
@@ -375,6 +551,7 @@ def chat_loop(
                 channel.send(response)
                 with history_lock:
                     history.append(("agent", response))
+                    save_history(history)
 
         except Exception as e:
             print(f"[Chat loop error] {e}")
@@ -389,15 +566,35 @@ def main():
     telegram = TelegramChannel()
     telegram.on_startup()
 
-    channels        = [telegram]   # all channels polled by the chat loop
-    primary_channel = telegram     # where push notifications are sent
+    channels = [telegram]   # all channels polled by the chat loop
 
-    history      = deque(maxlen=MAX_HISTORY_TURNS * 2)
+    # Slack is optional — only activated when both env vars are present.
+    slack: SlackChannel | None = None
+    if os.environ.get("SLACK_BOT_TOKEN") and (
+        os.environ.get("SLACK_CHANNEL_ID") or os.environ.get("SLACK_USER_ID")
+    ):
+        slack = SlackChannel()
+        slack.on_startup()
+        channels.append(slack)
+
+    # Discord is optional — only activated when both env vars are present.
+    if os.environ.get("DISCORD_BOT_TOKEN") and os.environ.get("DISCORD_CHANNEL_ID"):
+        discord = DiscordChannel()
+        discord.on_startup()
+        channels.append(discord)
+
+    def get_push_channel() -> BaseChannel:
+        """Return Slack during work hours (if configured), Telegram otherwise."""
+        if slack and is_work_hours():
+            return slack
+        return telegram
+
+    history      = load_history()
     history_lock = threading.Lock()
 
     push_thread = threading.Thread(
         target=push_loop,
-        args=(primary_channel, history, history_lock),
+        args=(get_push_channel, history, history_lock),
         daemon=True,
         name="push-loop",
     )
